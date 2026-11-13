@@ -6,6 +6,7 @@ package mongodbatlasreceiver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -18,8 +19,10 @@ import (
 	"go.mongodb.org/atlas/mongodbatlas"
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/consumer/consumertest"
 	"go.opentelemetry.io/collector/extension/xextension/storage"
+	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/receiver/receivertest"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/golden"
@@ -180,6 +183,98 @@ func TestProjectGetFailure(t *testing.T) {
 		return sink.LogRecordCount() > 0
 	}, 2*time.Second, 500*time.Millisecond)
 	require.NoError(t, r.Shutdown(t.Context()))
+}
+
+func TestPollEventsCheckpointOnError(t *testing.T) {
+	errAPI := errors.New("api error")
+	errConsumer := errors.New("consumer error")
+
+	cases := []struct {
+		name        string
+		setupClient func(t *testing.T, mClient *mockEventsClient)
+		// failConsume makes the first ConsumeLogs call fail.
+		failConsume bool
+	}{
+		{
+			name: "project events request fails",
+			setupClient: func(t *testing.T, mClient *mockEventsClient) {
+				mClient.On("GetProjectEvents", mock.Anything, mock.Anything, mock.Anything).Return([]*mongodbatlas.Event(nil), false, errAPI).Once()
+				mClient.On("GetProjectEvents", mock.Anything, mock.Anything, mock.Anything).Return(mClient.loadTestEvents(t, "project-events.json"), false, nil)
+				mClient.On("GetOrganizationEvents", mock.Anything, mock.Anything, mock.Anything).Return(mClient.loadTestEvents(t, "org-events.json"), false, nil)
+			},
+		},
+		{
+			name: "organization events request fails",
+			setupClient: func(t *testing.T, mClient *mockEventsClient) {
+				mClient.On("GetProjectEvents", mock.Anything, mock.Anything, mock.Anything).Return(mClient.loadTestEvents(t, "project-events.json"), false, nil)
+				mClient.On("GetOrganizationEvents", mock.Anything, mock.Anything, mock.Anything).Return([]*mongodbatlas.Event(nil), false, errAPI).Once()
+				mClient.On("GetOrganizationEvents", mock.Anything, mock.Anything, mock.Anything).Return(mClient.loadTestEvents(t, "org-events.json"), false, nil)
+			},
+		},
+		{
+			name: "consumer fails",
+			setupClient: func(t *testing.T, mClient *mockEventsClient) {
+				mClient.On("GetProjectEvents", mock.Anything, mock.Anything, mock.Anything).Return(mClient.loadTestEvents(t, "project-events.json"), false, nil)
+				mClient.On("GetOrganizationEvents", mock.Anything, mock.Anything, mock.Anything).Return(mClient.loadTestEvents(t, "org-events.json"), false, nil)
+			},
+			failConsume: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := createDefaultConfig().(*Config)
+			cfg.Events = configoptional.Some(EventsConfig{
+				Projects:      []*ProjectConfig{{Name: testProjectName}},
+				Organizations: []*OrgConfig{{ID: testOrgID}},
+				PollInterval:  time.Minute,
+			})
+
+			sink := &consumertest.LogsSink{}
+			consumed := 0
+			logsConsumer, err := consumer.NewLogs(func(ctx context.Context, ld plog.Logs) error {
+				consumed++
+				if tc.failConsume && consumed == 1 {
+					return errConsumer
+				}
+				return sink.ConsumeLogs(ctx, ld)
+			})
+			require.NoError(t, err)
+
+			r, err := newEventsReceiver(receivertest.NewNopSettings(metadata.Type), cfg, logsConsumer)
+			require.NoError(t, err)
+			mClient := &mockEventsClient{}
+			mClient.setupGetProject()
+			mClient.setupGetOrganization()
+			tc.setupClient(t, mClient)
+			r.client = mClient
+
+			start := time.Now().Add(-time.Hour).UTC()
+			r.record = &eventRecord{NextStartTime: &start}
+
+			require.Error(t, r.pollEvents(t.Context()))
+			require.NotNil(t, r.record.NextStartTime)
+			require.True(t, start.Equal(*r.record.NextStartTime), "checkpoint must not advance after a failed poll")
+
+			require.NoError(t, r.pollEvents(t.Context()))
+			require.True(t, r.record.NextStartTime.After(start), "checkpoint must advance after a successful poll")
+
+			// Every request in the retried poll must start from the original checkpoint.
+			var minDates []time.Time
+			for _, call := range mClient.Calls {
+				if call.Method == "GetProjectEvents" || call.Method == "GetOrganizationEvents" {
+					minDates = append(minDates, call.Arguments.Get(2).(*internal.GetEventsOptions).MinDate)
+				}
+			}
+			require.Len(t, minDates, 4)
+			for _, minDate := range minDates {
+				require.True(t, start.Equal(minDate))
+			}
+
+			// The retried poll delivers both the project and the organization events.
+			require.GreaterOrEqual(t, sink.LogRecordCount(), 2)
+		})
+	}
 }
 
 type mockEventsClient struct {
