@@ -188,6 +188,15 @@ func (a *alertsReceiver) retrieveAndProcessAlerts(ctx context.Context) error {
 }
 
 func (a *alertsReceiver) pollAndProcess(ctx context.Context, pc *ProjectConfig, project *mongodbatlas.Project) {
+	// Filter every page against the checkpoint from the previous poll and only
+	// store the new checkpoint after the last page, so alerts on a later page are
+	// not dropped because an earlier page contained a newer alert.
+	lastRecorded := pcommon.Timestamp(0).AsTime()
+	if t := a.record.GetLastRecorded(project.ID); t != nil {
+		lastRecorded = *t
+	}
+	latest := lastRecorded
+
 	for pageNum := 1; pageNum <= int(a.maxPages); pageNum++ {
 		projectAlerts, hasNext, err := a.client.GetAlerts(ctx, project.ID, &internal.AlertPollOptions{
 			PageNum:  pageNum,
@@ -198,7 +207,10 @@ func (a *alertsReceiver) pollAndProcess(ctx context.Context, pc *ProjectConfig, 
 			break
 		}
 
-		filteredAlerts := a.applyFilters(pc, projectAlerts)
+		filteredAlerts, latestInPage := a.applyFilters(pc, projectAlerts, lastRecorded)
+		if latestInPage.After(latest) {
+			latest = latestInPage
+		}
 		now := pcommon.NewTimestampFromTime(time.Now())
 		logs, err := a.convertAlerts(now, filteredAlerts, project)
 		if err != nil {
@@ -215,6 +227,10 @@ func (a *alertsReceiver) pollAndProcess(ctx context.Context, pc *ProjectConfig, 
 		if !hasNext {
 			break
 		}
+	}
+
+	if latest.After(lastRecorded) {
+		a.record.SetLastRecorded(project.ID, &latest)
 	}
 }
 
@@ -501,13 +517,29 @@ func payloadToLogs(now time.Time, payload []byte) (plog.Logs, error) {
 // can have custom marshaling
 type alertRecord struct {
 	sync.Mutex
+	// LastRecordedTime is the checkpoint shared by all projects that was written
+	// by earlier versions. It is only used for projects without an entry in Projects.
 	LastRecordedTime *time.Time `mapstructure:"last_recorded"`
+	// Projects holds the update time of the latest processed alert per project ID.
+	Projects map[string]*time.Time `mapstructure:"projects"`
 }
 
-func (a *alertRecord) SetLastRecorded(lastUpdated *time.Time) {
+func (a *alertRecord) GetLastRecorded(projectID string) *time.Time {
 	a.Lock()
-	a.LastRecordedTime = lastUpdated
-	a.Unlock()
+	defer a.Unlock()
+	if lastUpdated, ok := a.Projects[projectID]; ok {
+		return lastUpdated
+	}
+	return a.LastRecordedTime
+}
+
+func (a *alertRecord) SetLastRecorded(projectID string, lastUpdated *time.Time) {
+	a.Lock()
+	defer a.Unlock()
+	if a.Projects == nil {
+		a.Projects = make(map[string]*time.Time)
+	}
+	a.Projects[projectID] = lastUpdated
 }
 
 func (a *alertsReceiver) syncPersistence(ctx context.Context) error {
@@ -540,14 +572,10 @@ func (a *alertsReceiver) writeCheckpoint(ctx context.Context) error {
 	return a.storageClient.Set(ctx, alertCacheKey, marshalBytes)
 }
 
-func (a *alertsReceiver) applyFilters(pConf *ProjectConfig, alerts []mongodbatlas.Alert) []*mongodbatlas.Alert {
+// applyFilters returns the alerts that were updated after lastRecordedTime and match
+// the project's cluster filters, along with the latest update time among them.
+func (a *alertsReceiver) applyFilters(pConf *ProjectConfig, alerts []mongodbatlas.Alert, lastRecordedTime time.Time) ([]*mongodbatlas.Alert, time.Time) {
 	filtered := []*mongodbatlas.Alert{}
-
-	lastRecordedTime := pcommon.Timestamp(0).AsTime()
-	if a.record.LastRecordedTime != nil {
-		lastRecordedTime = *a.record.LastRecordedTime
-	}
-	// we need to maintain two timestamps in order to not conflict while iterating
 	latestInPayload := pcommon.Timestamp(0).AsTime()
 
 	for i := range alerts {
@@ -581,11 +609,7 @@ func (a *alertsReceiver) applyFilters(pConf *ProjectConfig, alerts []mongodbatla
 		}
 	}
 
-	if latestInPayload.After(lastRecordedTime) {
-		a.record.SetLastRecorded(&latestInPayload)
-	}
-
-	return filtered
+	return filtered, latestInPayload
 }
 
 func timestampFromAlert(a model.Alert) pcommon.Timestamp {

@@ -6,6 +6,7 @@ package mongodbatlasreceiver
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -634,6 +635,114 @@ func TestAlertPollingExclusions(t *testing.T) {
 	}, 3*time.Second, 10*time.Millisecond)
 
 	require.NoError(t, alertsRcvr.Shutdown(t.Context()))
+}
+
+func TestAlertsRetrievalCheckpoint(t *testing.T) {
+	newAlert := func(id, updated string) mongodbatlas.Alert {
+		alert := testAlert()
+		alert.ID = id
+		alert.Updated = updated
+		return alert
+	}
+	newer := newAlert("newer", "2025-01-02T00:00:00Z")
+	older := newAlert("older", "2025-01-01T00:00:00Z")
+
+	cases := []struct {
+		name     string
+		projects []*ProjectConfig
+		client   func() *mockAlertsClient
+		// expectedCheckpoints maps project ID to the expected checkpoint after polling.
+		expectedCheckpoints map[string]string
+	}{
+		{
+			name:     "older alert in a later project",
+			projects: []*ProjectConfig{{Name: "a"}, {Name: "b"}},
+			client: func() *mockAlertsClient {
+				client := &mockAlertsClient{}
+				for _, id := range []string{"a", "b"} {
+					client.On("GetProject", mock.Anything, id).Return(&mongodbatlas.Project{ID: id, Name: id}, nil)
+				}
+				client.On("GetAlerts", mock.Anything, "a", mock.Anything).Return([]mongodbatlas.Alert{newer}, false, nil)
+				client.On("GetAlerts", mock.Anything, "b", mock.Anything).Return([]mongodbatlas.Alert{older}, false, nil)
+				return client
+			},
+			expectedCheckpoints: map[string]string{
+				"a": newer.Updated,
+				"b": older.Updated,
+			},
+		},
+		{
+			name:     "older alert on a later page",
+			projects: []*ProjectConfig{{Name: "a"}},
+			client: func() *mockAlertsClient {
+				client := &mockAlertsClient{}
+				client.On("GetProject", mock.Anything, "a").Return(&mongodbatlas.Project{ID: "a", Name: "a"}, nil)
+				client.On("GetAlerts", mock.Anything, "a", mock.MatchedBy(func(opts *internal.AlertPollOptions) bool {
+					return opts.PageNum == 1
+				})).Return([]mongodbatlas.Alert{newer}, true, nil)
+				client.On("GetAlerts", mock.Anything, "a", mock.MatchedBy(func(opts *internal.AlertPollOptions) bool {
+					return opts.PageNum == 2
+				})).Return([]mongodbatlas.Alert{older}, false, nil)
+				return client
+			},
+			expectedCheckpoints: map[string]string{
+				"a": newer.Updated,
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sink := &consumertest.LogsSink{}
+			cfg := &Config{Alerts: AlertConfig{
+				Mode:     alertModePoll,
+				MaxPages: defaultAlertsMaxPages,
+				PageSize: defaultAlertsPageSize,
+				Projects: tc.projects,
+			}}
+			receiver, err := newAlertsReceiver(receivertest.NewNopSettings(metadata.Type), cfg, sink)
+			require.NoError(t, err)
+			receiver.client = tc.client()
+			receiver.storageClient = storage.NewNopClient()
+			require.NoError(t, receiver.syncPersistence(t.Context()))
+
+			// The second poll returns the same alerts, which must not be delivered again.
+			require.NoError(t, receiver.retrieveAndProcessAlerts(t.Context()))
+			require.NoError(t, receiver.retrieveAndProcessAlerts(t.Context()))
+			require.Equal(t, 2, sink.LogRecordCount())
+
+			for projectID, expected := range tc.expectedCheckpoints {
+				checkpoint := receiver.record.GetLastRecorded(projectID)
+				require.NotNil(t, checkpoint)
+				require.Equal(t, expected, checkpoint.Format(time.RFC3339))
+			}
+		})
+	}
+}
+
+func TestAlertRecordLegacyCheckpoint(t *testing.T) {
+	legacy := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	data, err := json.Marshal(map[string]any{"LastRecordedTime": legacy})
+	require.NoError(t, err)
+
+	var record alertRecord
+	require.NoError(t, json.Unmarshal(data, &record))
+
+	// Projects without their own checkpoint fall back to the shared checkpoint.
+	require.Equal(t, legacy, *record.GetLastRecorded("a"))
+
+	updated := legacy.Add(time.Hour)
+	record.SetLastRecorded("a", &updated)
+	require.Equal(t, updated, *record.GetLastRecorded("a"))
+	require.Equal(t, legacy, *record.GetLastRecorded("b"))
+
+	// The per-project checkpoints survive a round trip through storage.
+	data, err = json.Marshal(&record)
+	require.NoError(t, err)
+	var restored alertRecord
+	require.NoError(t, json.Unmarshal(data, &restored))
+	require.True(t, updated.Equal(*restored.GetLastRecorded("a")))
+	require.True(t, legacy.Equal(*restored.GetLastRecorded("b")))
 }
 
 func testClient() *mockAlertsClient {
